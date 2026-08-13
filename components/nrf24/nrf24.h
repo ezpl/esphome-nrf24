@@ -33,6 +33,11 @@ static constexpr uint8_t NRF24_TX_QUEUE_DEPTH = 8;
  *
  * TX never blocks: send() enqueues and loop() drains the queue through a state
  * machine, one SPI status read per iteration while a packet is in flight.
+ *
+ * loop() disables itself once there is nothing queued, nothing in flight and
+ * the chip is out of RX, so an idle radio costs zero per iteration. send() and
+ * start_listening() re-arm it; the watchdog runs off the scheduler so it keeps
+ * checking the link whether the loop is armed or not.
  */
 class NRF24Component : public Component,
                        public spi::SPIDevice<spi::BIT_ORDER_MSB_FIRST, spi::CLOCK_POLARITY_LOW,
@@ -184,6 +189,15 @@ class NRF24Component : public Component,
   void start_tx_(const TxPacket &packet);
   void finish_tx_(bool success);
 
+  /// True while loop() still has something to service. The gate for disable_loop().
+  bool has_loop_work_() const {
+    // chip_rx_ as well as listening_: whatever put the chip into RX, the FIFO
+    // needs draining before the loop may go quiet.
+    return this->is_transmitting() || this->listening_ || this->chip_rx_;
+  }
+  /// Link check, on the scheduler so a disabled loop cannot mute it.
+  void watchdog_();
+
   uint8_t dynamic_payload_size_();
 
   GPIOPin *ce_pin_{nullptr};
@@ -237,7 +251,6 @@ class NRF24Component : public Component,
   bool tx_queue_full_logged_{false};
 
   uint32_t last_rx_poll_ms_{0};
-  uint32_t last_watchdog_ms_{0};
   /// Set while the watchdog reports the chip missing, so it logs once per outage.
   bool link_warned_{false};
 };

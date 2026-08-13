@@ -299,6 +299,10 @@ Each `loop()`:
   100 ms the packet is dropped with a warning. A few microseconds per loop.
 - **Queue empty** — retunes to the configured channel and returns to RX if
   `listen` was on.
+- **Nothing queued and not listening** — `loop()` switches itself off with
+  `disable_loop()` and costs exactly zero per iteration. `send()` and
+  `start_listening()` switch it back on. While `listen` is on the loop stays
+  armed: without an ISR on `irq_pin` the RX FIFO has nobody else to drain it.
 
 Nothing waits on the radio. `get_tx_ok_count()` and `get_tx_fail_count()` tell
 you how it is going.
@@ -311,7 +315,8 @@ either fails, the component logs one error, calls `mark_failed()`, and stops —
 
 A watchdog repeats that probe every 30 seconds while idle. If the chip goes
 missing it raises a warning once; when it comes back the stored configuration is
-rewritten and the warning clears.
+rewritten and the warning clears. It runs on the scheduler rather than in
+`loop()`, so switching the loop off cannot mute it.
 
 ## Licence
 

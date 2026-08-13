@@ -38,6 +38,9 @@ void NRF24Component::setup() {
 
   this->apply_config_();
   this->ready_ = true;
+  // On the scheduler, not in loop(): the loop switches itself off when the
+  // radio is idle, and a dead radio still has to be noticed.
+  this->set_interval(WATCHDOG_INTERVAL_MS, [this]() { this->watchdog_(); });
   ESP_LOGI(TAG, "nRF24L01+ ready on channel %u", this->channel_);
 }
 
@@ -45,11 +48,16 @@ void NRF24Component::loop() {
   this->process_tx_();
   this->process_rx_();
 
-  const uint32_t now = millis();
-  if (now - this->last_watchdog_ms_ < WATCHDOG_INTERVAL_MS) {
-    return;
+  // Nothing queued, nothing on the air, chip out of RX: no state can change
+  // until send() or start_listening() is called, and both re-arm the loop.
+  // is_failed() is checked because disable_loop() would otherwise overwrite
+  // FAILED with LOOP_DONE and quietly un-fail the component.
+  if (!this->has_loop_work_() && !this->is_failed()) {
+    this->disable_loop();
   }
-  this->last_watchdog_ms_ = now;
+}
+
+void NRF24Component::watchdog_() {
   if (this->tx_state_ != TX_IDLE) {
     return;  // never poke the scratch register while a packet is on the air
   }
@@ -65,6 +73,13 @@ void NRF24Component::loop() {
     ESP_LOGW(TAG, "nRF24L01+ stopped answering on SPI");
     this->link_warned_ = true;
     this->status_set_warning();
+  }
+
+  // Backstop. Every path that creates work re-arms the loop itself; if one ever
+  // fails to, this bounds the damage to one watchdog interval instead of
+  // leaving the loop off with a packet stuck in the queue.
+  if (this->has_loop_work_()) {
+    this->enable_loop();
   }
 }
 
@@ -478,6 +493,9 @@ void NRF24Component::close_reading_pipe(uint8_t pipe) {
 
 void NRF24Component::start_listening() {
   this->listening_ = true;
+  // Unconditional: even when a burst defers entry to RX, the loop has to be
+  // running for finish_tx_() to get there.
+  this->enable_loop();
   if (this->ready_ && this->tx_state_ == TX_IDLE && this->tx_count_ == 0) {
     this->enter_rx_();
   }
@@ -603,6 +621,8 @@ bool NRF24Component::send(const uint8_t *buf, uint8_t len, uint8_t channel, cons
   memcpy(slot.addr, addr, addr_len);
   this->tx_head_ = static_cast<uint8_t>((this->tx_head_ + 1) % NRF24_TX_QUEUE_DEPTH);
   this->tx_count_++;
+  // Main thread only — send() is not ISR-safe anyway, so the plain call is right.
+  this->enable_loop();
   return true;
 }
 
