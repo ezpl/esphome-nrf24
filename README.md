@@ -134,8 +134,8 @@ on_packet:
 ### `nrf24.send`
 
 Queues one packet. Returns immediately; the queue holds 8 packets and drains
-across `loop()` iterations. Accepts a byte list, a quoted string, or a lambda
-returning `std::vector<uint8_t>`.
+across `loop()` iterations. `data` accepts a byte list, a quoted string, or a
+lambda returning `std::vector<uint8_t>`.
 
 ```yaml
 - nrf24.send: [0x01, 0x02, 0x03]      # shorthand
@@ -145,9 +145,20 @@ returning `std::vector<uint8_t>`.
 - nrf24.send:
     id: radio
     data: !lambda return {0x01, 0x00, 0xFF};
+- nrf24.send:                          # this packet only, no lasting change
+    id: radio
+    data: [0xAA, 0xBB]
+    channel: 42
+    address: [0x01, 0x02, 0x03, 0x04, 0x05]
 ```
 
-A literal list is placed in flash, not copied into RAM. Length must be 1–32.
+`channel` and `address` are optional and templatable; omit them and the radio's
+current settings are used. A literal list is placed in flash, not copied into
+RAM. Length must be 1–32 for `data`, 2–5 for `address`.
+
+**Queue entries are self-contained.** Each one carries its own payload, channel
+and destination address, captured when it was queued — so changing the channel
+or TX address afterwards never retargets a frame that is already in the queue.
 
 ### `nrf24.set_channel`
 
@@ -180,7 +191,8 @@ Everything a downstream component needs is public. Grab the instance with
 
 ```cpp
 // transmit — never blocks, never pads
-bool send(const uint8_t *buf, uint8_t len);
+bool send(const uint8_t *buf, uint8_t len, uint8_t channel, const uint8_t *addr, uint8_t addr_len);
+bool send(const uint8_t *buf, uint8_t len);   // snapshots the current channel + address
 bool send(const std::vector<uint8_t> &data);
 uint8_t tx_queue_free();
 bool is_transmitting();
@@ -197,6 +209,8 @@ bool is_listening();
 
 // addressing, all runtime
 void set_tx_address(const uint8_t *addr, uint8_t len);
+const uint8_t *get_tx_address();
+uint8_t get_tx_address_len();
 void open_reading_pipe(uint8_t pipe, const uint8_t *addr, uint8_t len);
 void close_reading_pipe(uint8_t pipe);
 void set_address_width(uint8_t width);   // 2..5
@@ -258,19 +272,33 @@ this component lets you ask for it.
 
 ## How TX works
 
-`send()` copies the bytes into a ring buffer of 8 slots and returns. It never
-touches the SPI bus.
+`send()` copies the payload, the channel and the destination address into a
+ring buffer of 8 slots and returns. It never touches the SPI bus, and it never
+allocates.
+
+Because each slot is self-contained, this is safe:
+
+```cpp
+radio->set_tx_address(cabinet_a, 5);  radio->send(f1, n1);  radio->send(f2, n2);
+radio->set_tx_address(cabinet_b, 5);  radio->send(f3, n3);  radio->send(f4, n4);
+```
+
+`f1` and `f2` still go to cabinet A even though the queue had not drained when
+the address changed. Nothing here depends on drain timing.
 
 Each `loop()`:
 
-- **Idle with something queued** — leaves RX if needed, writes the payload with
+- **Idle with something queued** — leaves RX if needed, applies that packet's
+  channel and address (skipping the SPI writes when the chip already matches,
+  so the single-target case costs nothing), writes the payload with
   `W_TX_PAYLOAD` (exactly `len` bytes), pulses CE high for 15 µs, records the
   start time, and returns. About 150 µs.
 - **Packet in flight** — one single-byte NOP transfer to read `STATUS`. On
   `TX_DS` the packet succeeded; on `MAX_RT` it failed, and the TX FIFO is
   flushed because `MAX_RT` otherwise blocks every later transmission. Past
   100 ms the packet is dropped with a warning. A few microseconds per loop.
-- **Queue empty** — returns to RX if `listen` was on.
+- **Queue empty** — retunes to the configured channel and returns to RX if
+  `listen` was on.
 
 Nothing waits on the radio. `get_tx_ok_count()` and `get_tx_fail_count()` tell
 you how it is going.

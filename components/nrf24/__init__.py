@@ -174,22 +174,19 @@ async def to_code(config):
         )
 
 
-async def _byte_array_action_to_code(config, action_id, template_arg, args, key):
-    var = cg.new_Pvariable(action_id, template_arg)
-    await cg.register_parented(var, config[CONF_ID])
-    data = config[key]
-    if isinstance(data, bytes):
-        data = list(data)
+async def _set_byte_array(var, name, value, action_id, args):
+    """Feed a byte array to set_<name>_static / set_<name>_template."""
+    if isinstance(value, bytes):
+        value = list(value)
 
-    if cg.is_template(data):
-        templ = await cg.templatable(data, args, cg.std_vector.template(cg.uint8))
-        cg.add(var.set_data_template(templ))
+    if cg.is_template(value):
+        templ = await cg.templatable(value, args, cg.std_vector.template(cg.uint8))
+        cg.add(getattr(var, f"set_{name}_template")(templ))
     else:
         # Literal bytes live in flash, not in a RAM copy.
-        arr_id = ID(f"{action_id}_data", is_declaration=True, type=cg.uint8)
-        arr = cg.static_const_array(arr_id, cg.ArrayInitializer(*data))
-        cg.add(var.set_data_static(arr, len(data)))
-    return var
+        arr_id = ID(f"{action_id}_{name}", is_declaration=True, type=cg.uint8)
+        arr = cg.static_const_array(arr_id, cg.ArrayInitializer(*value))
+        cg.add(getattr(var, f"set_{name}_static")(arr, len(value)))
 
 
 @automation.register_action(
@@ -199,15 +196,24 @@ async def _byte_array_action_to_code(config, action_id, template_arg, args, key)
         {
             cv.GenerateID(): cv.use_id(NRF24Component),
             cv.Required(CONF_DATA): cv.templatable(validate_payload),
+            cv.Optional(CONF_CHANNEL): cv.templatable(cv.int_range(min=0, max=125)),
+            cv.Optional(CONF_ADDRESS): cv.templatable(validate_address),
         },
         key=CONF_DATA,
     ),
     synchronous=True,
 )
 async def nrf24_send_to_code(config, action_id, template_arg, args):
-    return await _byte_array_action_to_code(
-        config, action_id, template_arg, args, CONF_DATA
-    )
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    await _set_byte_array(var, "data", config[CONF_DATA], action_id, args)
+    if (address := config.get(CONF_ADDRESS)) is not None:
+        await _set_byte_array(var, "address", address, action_id, args)
+    if (channel := config.get(CONF_CHANNEL)) is not None:
+        # Must go through cg.templatable: TemplatableFn stores a function pointer only.
+        templ = await cg.templatable(channel, args, cg.uint8)
+        cg.add(var.set_channel(templ))
+    return var
 
 
 @automation.register_action(
@@ -223,9 +229,10 @@ async def nrf24_send_to_code(config, action_id, template_arg, args):
     synchronous=True,
 )
 async def nrf24_set_tx_address_to_code(config, action_id, template_arg, args):
-    return await _byte_array_action_to_code(
-        config, action_id, template_arg, args, CONF_ADDRESS
-    )
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    await _set_byte_array(var, "address", config[CONF_ADDRESS], action_id, args)
+    return var
 
 
 @automation.register_action(

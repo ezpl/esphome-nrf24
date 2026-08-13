@@ -100,10 +100,25 @@ button:
       - nrf24.start_listening:
 
   - platform: template
-    name: Retarget and send
+    name: Two targets, back to back
     on_press:
-      - nrf24.set_tx_address: [0x01, 0x02, 0x03, 0x04, 0x05]
-      - nrf24.send: [0xAA, 0xBB]
+      # Both frames for A still reach A even though the queue has not drained
+      # by the time the address changes: each queue entry carries its own target.
+      - nrf24.set_tx_address: [0x0A, 0x0A, 0x0A, 0x0A, 0x0A]
+      - nrf24.send: [0x01, 0x00, 0xA1]
+      - nrf24.send: [0x01, 0x00, 0xA2]
+      - nrf24.set_tx_address: [0x0B, 0x0B, 0x0B, 0x0B, 0x0B]
+      - nrf24.send: [0x01, 0x00, 0xB1]
+
+  - platform: template
+    name: One-off on another channel
+    on_press:
+      # Per-packet override; the radio's own channel and address are untouched.
+      - nrf24.send:
+          id: radio
+          data: [0xAA, 0xBB]
+          channel: 42
+          address: [0x01, 0x02, 0x03, 0x04, 0x05]
 
   - platform: template
     name: Prove the chip is there

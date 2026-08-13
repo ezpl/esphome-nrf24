@@ -212,7 +212,12 @@ void NRF24Component::apply_config_() {
 
   this->write_register(nRF24L01::SETUP_RETR,
                        static_cast<uint8_t>((this->retry_delay_ & 0x0F) << 4 | (this->retry_count_ & 0x0F)));
-  this->write_register(nRF24L01::RF_CH, this->channel_);
+
+  // Nothing on the chip is trustworthy after a reset, so invalidate the
+  // reconciliation shadows and let the sync helpers write unconditionally.
+  this->chip_channel_ = 0xFF;
+  this->chip_tx_address_len_ = 0;
+  this->sync_channel_(this->channel_);
 
   uint8_t rf_setup = static_cast<uint8_t>((this->pa_level_ & 0x03) << 1);
   if (this->lna_enable_) {
@@ -245,7 +250,7 @@ void NRF24Component::apply_config_() {
     this->write_register(static_cast<uint8_t>(nRF24L01::RX_PW_P0 + pipe), this->payload_size_);
   }
 
-  this->write_register(nRF24L01::TX_ADDR, this->tx_address_, this->tx_address_len_);
+  this->sync_tx_address_(this->tx_address_, this->tx_address_len_);
   if (this->pipe0_address_len_ > 0) {
     this->write_register(nRF24L01::RX_ADDR_P0, this->pipe0_address_, this->pipe0_address_len_);
   } else {
@@ -269,13 +274,32 @@ void NRF24Component::apply_config_() {
   }
 }
 
+void NRF24Component::sync_channel_(uint8_t channel) {
+  if (this->chip_channel_ == channel) {
+    return;
+  }
+  this->write_register(nRF24L01::RF_CH, channel);
+  this->chip_channel_ = channel;
+}
+
+void NRF24Component::sync_tx_address_(const uint8_t *addr, uint8_t len) {
+  if (this->chip_tx_address_len_ == len && memcmp(this->chip_tx_address_, addr, len) == 0) {
+    return;
+  }
+  this->write_register(nRF24L01::TX_ADDR, addr, len);
+  memcpy(this->chip_tx_address_, addr, len);
+  this->chip_tx_address_len_ = len;
+}
+
 void NRF24Component::set_channel(uint8_t channel) {
   if (channel > 125) {
     channel = 125;
   }
   this->channel_ = channel;
-  if (this->ready_) {
-    this->write_register(nRF24L01::RF_CH, channel);
+  // Retuning mid-packet would wreck the frame on the air; the drain step and
+  // enter_rx_() reconcile the chip afterwards anyway.
+  if (this->ready_ && this->tx_state_ == TX_IDLE) {
+    this->sync_channel_(channel);
   }
 }
 
@@ -395,13 +419,10 @@ void NRF24Component::set_tx_address(const uint8_t *addr, uint8_t len) {
   }
   memcpy(this->tx_address_, addr, len);
   this->tx_address_len_ = len;
-  if (!this->ready_) {
-    return;
-  }
-  this->write_register(nRF24L01::TX_ADDR, this->tx_address_, len);
-  // The auto-ACK comes back on pipe 0, so its address has to match while transmitting.
-  if ((this->en_aa_ & 0x01) != 0 && !this->chip_rx_) {
-    this->write_register(nRF24L01::RX_ADDR_P0, this->tx_address_, len);
+  // Only the configured value changes here. Packets already queued keep the
+  // address they were given, and the drain step writes TX_ADDR per packet.
+  if (this->ready_ && this->tx_state_ == TX_IDLE && this->tx_count_ == 0) {
+    this->sync_tx_address_(this->tx_address_, len);
   }
 }
 
@@ -470,6 +491,9 @@ void NRF24Component::stop_listening() {
 }
 
 void NRF24Component::enter_rx_() {
+  // A burst may have parked the chip on a per-packet channel. Listening happens
+  // on the configured one.
+  this->sync_channel_(this->channel_);
   if (this->pipe0_address_len_ > 0) {
     this->write_register(nRF24L01::RX_ADDR_P0, this->pipe0_address_, this->pipe0_address_len_);
   }
@@ -540,12 +564,28 @@ uint8_t NRF24Component::dynamic_payload_size_() {
 // ====================== Transmit ======================
 
 bool NRF24Component::send(const uint8_t *buf, uint8_t len) {
+  // Snapshot the target now, not when the packet reaches the air. Otherwise
+  // set_tx_address(B) before the queue drains would send A's frames to B.
+  return this->send(buf, len, this->channel_, this->tx_address_, this->tx_address_len_);
+}
+
+bool NRF24Component::send(const uint8_t *buf, uint8_t len, uint8_t channel, const uint8_t *addr, uint8_t addr_len) {
   if (this->is_failed() || !this->ready_) {
     return false;
   }
   if (buf == nullptr || len == 0 || len > NRF24_MAX_PAYLOAD) {
     ESP_LOGW(TAG, "Refusing to send %u bytes (must be 1..%u)", len, NRF24_MAX_PAYLOAD);
     return false;
+  }
+  if (addr == nullptr || addr_len == 0) {
+    addr = this->tx_address_;
+    addr_len = this->tx_address_len_;
+  }
+  if (addr_len > 5) {
+    addr_len = 5;
+  }
+  if (channel > 125) {
+    channel = 125;
   }
   if (this->tx_count_ >= NRF24_TX_QUEUE_DEPTH) {
     if (!this->tx_queue_full_logged_) {
@@ -558,6 +598,9 @@ bool NRF24Component::send(const uint8_t *buf, uint8_t len) {
   TxPacket &slot = this->tx_queue_[this->tx_head_];
   slot.len = len;
   memcpy(slot.data, buf, len);
+  slot.channel = channel;
+  slot.addr_len = addr_len;
+  memcpy(slot.addr, addr, addr_len);
   this->tx_head_ = static_cast<uint8_t>((this->tx_head_ + 1) % NRF24_TX_QUEUE_DEPTH);
   this->tx_count_++;
   return true;
@@ -585,8 +628,13 @@ void NRF24Component::start_tx_(const TxPacket &packet) {
   if (this->chip_rx_) {
     this->leave_rx_();
   }
+  // The packet carries its own target. Both syncs are no-ops when the chip is
+  // already there, so the single-cabinet case costs nothing.
+  this->sync_channel_(packet.channel);
+  this->sync_tx_address_(packet.addr, packet.addr_len);
   if ((this->en_aa_ & 0x01) != 0) {
-    this->write_register(nRF24L01::RX_ADDR_P0, this->tx_address_, this->tx_address_len_);
+    // The auto-ACK returns on pipe 0, so its address must match this packet's.
+    this->write_register(nRF24L01::RX_ADDR_P0, packet.addr, packet.addr_len);
   }
   this->write_register(nRF24L01::STATUS, nbit(nRF24L01::TX_DS) | nbit(nRF24L01::MAX_RT));
 

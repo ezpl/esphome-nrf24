@@ -56,8 +56,13 @@ class NRF24Component : public Component,
   }
 
   // ==================== Transmit ====================
-  /** Queue a packet of exactly @p len bytes. Never padded, never blocks.
+  /** Queue a packet for @p channel and @p addr. Exactly @p len bytes, never
+   *  padded, never blocks. Channel and address travel with the packet, so a
+   *  later set_channel() or set_tx_address() cannot redirect it.
    *  @return false if the queue is full or the radio failed. */
+  bool send(const uint8_t *buf, uint8_t len, uint8_t channel, const uint8_t *addr, uint8_t addr_len);
+  /** Queue a packet for the channel and TX address configured *right now*.
+   *  Both are snapshotted at this call, not when the packet reaches the air. */
   bool send(const uint8_t *buf, uint8_t len);
   bool send(const std::vector<uint8_t> &data) { return this->send(data.data(), static_cast<uint8_t>(data.size())); }
 
@@ -78,6 +83,9 @@ class NRF24Component : public Component,
   void set_tx_address(const std::vector<uint8_t> &addr) {
     this->set_tx_address(addr.data(), static_cast<uint8_t>(addr.size()));
   }
+  /// The configured TX address, i.e. what a bare send() would snapshot.
+  const uint8_t *get_tx_address() const { return this->tx_address_; }
+  uint8_t get_tx_address_len() const { return this->tx_address_len_; }
   void open_reading_pipe(uint8_t pipe, const uint8_t *addr, uint8_t len);
   void open_reading_pipe(uint8_t pipe, const std::vector<uint8_t> &addr) {
     this->open_reading_pipe(pipe, addr.data(), static_cast<uint8_t>(addr.size()));
@@ -144,8 +152,13 @@ class NRF24Component : public Component,
     TX_IN_FLIGHT,
   };
 
+  /// Self-contained: everything the drain step needs to put this frame on the
+  /// air, so nothing that happens after send() can retarget it.
   struct TxPacket {
     uint8_t len;
+    uint8_t channel;
+    uint8_t addr_len;
+    uint8_t addr[5];
     uint8_t data[NRF24_MAX_PAYLOAD];
   };
 
@@ -160,6 +173,10 @@ class NRF24Component : public Component,
   void apply_config_();
   void enter_rx_();
   void leave_rx_();
+
+  // --- chip state reconciliation: write only when it actually differs ---
+  void sync_channel_(uint8_t channel);
+  void sync_tx_address_(const uint8_t *addr, uint8_t len);
 
   // --- loop halves ---
   void process_tx_();
@@ -195,6 +212,12 @@ class NRF24Component : public Component,
   uint8_t pipe_lsb_[6]{};   ///< LSByte for pipes 2..5
   uint8_t en_rxaddr_{0x00};  ///< mirror of EN_RXADDR
   uint8_t en_aa_{0x3F};      ///< mirror of EN_AA
+
+  // What RF_CH and TX_ADDR actually hold. Separate from the configured values
+  // above, because a queued packet may temporarily point the chip elsewhere.
+  uint8_t chip_channel_{0xFF};  ///< 0xFF is not a valid channel: forces the first write
+  uint8_t chip_tx_address_[5]{};
+  uint8_t chip_tx_address_len_{0};
 
   /// Whether the user wants RX; the chip may be out of RX during a TX burst.
   bool listening_{false};
