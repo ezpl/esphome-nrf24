@@ -1,0 +1,121 @@
+# nRF24L01+ on an ESP32-C3 SuperMini.
+#
+#   SCK 4 · MOSI 6 · MISO 5 · CSN 7 · CE 10 · IRQ 3
+#
+# Feed the radio from a solid 3.3 V rail with a 10 µF capacitor right at the
+# module — the C3's own regulator browns out under the PA current otherwise.
+
+esphome:
+  name: nrf24-example
+  friendly_name: nRF24 example
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ezpl/esphome-nrf24
+      ref: main
+    components: [nrf24]
+
+# The SPI bus is ESPHome's own. CSN is not listed here — it belongs to the
+# device below, because spi_device_schema owns the chip select.
+spi:
+  - id: radio_spi
+    interface: spi2
+    clk_pin: GPIO4
+    mosi_pin: GPIO6
+    miso_pin: GPIO5
+
+nrf24:
+  id: radio
+  spi_id: radio_spi
+  cs_pin: GPIO7 # CSN
+  ce_pin: GPIO10
+  irq_pin: GPIO3 # optional; only skips the idle RX poll
+  data_rate: 4MHz # SPI clock, not the RF bitrate
+  rf_data_rate: 1MBPS # RF bitrate: 250KBPS / 1MBPS / 2MBPS
+  channel: 76
+  pa_level: MAX
+  crc: "16"
+  address_width: 5
+  auto_ack: true
+  payload_size: 32
+  tx_address: [0xE7, 0xE7, 0xE7, 0xE7, 0xE7]
+  listen: true
+  retries:
+    delay: 5 # 5 → 1500 µs between retransmits
+    count: 15
+  on_packet:
+    - lambda: |-
+        // x is std::vector<uint8_t>: real length, 0x00 bytes intact.
+        char hex[format_hex_pretty_size(32)];
+        ESP_LOGI("example", "%u bytes: %s", x.size(), format_hex_pretty_to(hex, x));
+
+button:
+  - platform: template
+    name: Send hello
+    on_press:
+      - nrf24.send: [0x48, 0x45, 0x4C, 0x4C, 0x4F] # shorthand form
+      - nrf24.send:
+          id: radio
+          data: "hello"
+      - nrf24.send:
+          id: radio
+          data: !lambda |-
+            std::vector<uint8_t> out;
+            out.push_back(0x01);
+            out.push_back(0x00);   // survives — this is not a C string
+            out.push_back(0xFF);
+            return out;
+
+  - platform: template
+    name: Promiscuous mode
+    on_press:
+      # Sniffing needs no CRC, no auto-ACK and a 2-byte address.
+      - nrf24.stop_listening:
+      - lambda: |-
+          id(radio)->disable_crc();
+          id(radio)->set_auto_ack(false);
+          id(radio)->set_address_width(2);
+          static const uint8_t PREAMBLE[2] = {0x55, 0x00};
+          id(radio)->open_reading_pipe(1, PREAMBLE, 2);
+      - nrf24.set_channel: 2
+      - nrf24.start_listening:
+
+  - platform: template
+    name: Retarget and send
+    on_press:
+      - nrf24.set_tx_address: [0x01, 0x02, 0x03, 0x04, 0x05]
+      - nrf24.send: [0xAA, 0xBB]
+
+  - platform: template
+    name: Prove the chip is there
+    on_press:
+      - lambda: |-
+          // 0x03 is SETUP_AW; a live nRF24L01+ never answers 0x00 or 0xFF here
+          // unless it was deliberately put into 2-byte address mode.
+          ESP_LOGI("example", "SETUP_AW = 0x%02X", id(radio)->read_register(0x03));
+
+sensor:
+  - platform: template
+    name: nRF24 TX failures
+    lambda: return (float) id(radio)->get_tx_fail_count();
+    update_interval: 60s
+    accuracy_decimals: 0
